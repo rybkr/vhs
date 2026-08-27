@@ -138,7 +138,7 @@ func (vhs *VHS) Start(ctx context.Context) error {
 
 	path, _ := launcher.LookPath()
 	enableNoSandbox := os.Getenv("VHS_NO_SANDBOX") != ""
-	u, err := launcher.New().Leakless(false).Bin(path).NoSandbox(enableNoSandbox).Launch()
+	u, err := launcher.New().Leakless(false).Bin(path).NoSandbox(enableNoSandbox).Set("force-device-scale-factor", "1").Launch()
 	if err != nil {
 		return fmt.Errorf("could not launch browser: %w", err)
 	}
@@ -319,15 +319,22 @@ func (vhs *VHS) ApplyLoopOffset() error {
 
 const quality = 1.0
 
+// duplicateFrameWarningRatio is the fraction of duplicated frames above which
+// a warning is printed after recording.
+const duplicateFrameWarningRatio = 0.05
+
 // Record begins the goroutine which captures images from the xterm.js canvases.
 func (vhs *VHS) Record(ctx context.Context) <-chan error {
 	ch := make(chan error)
 	interval := time.Second / time.Duration(vhs.Options.Video.Framerate)
 
-	//nolint: mnd
 	go func() {
 		counter := 0
-		start := time.Now()
+		duplicates := 0
+		// lastFrame anchors the schedule to the wall clock: the frames written
+		// so far cover the time span up to lastFrame, and the next capture is
+		// due one interval after it.
+		lastFrame := time.Now()
 		for {
 			select {
 			case <-ctx.Done():
@@ -336,29 +343,46 @@ func (vhs *VHS) Record(ctx context.Context) <-chan error {
 				// Save total # of frames for offset calculation
 				vhs.totalFrames = counter
 
+				if counter > 0 && float64(duplicates)/float64(counter) > duplicateFrameWarningRatio {
+					fmt.Println(ErrorStyle.Render(fmt.Sprintf(
+						"WARN: recording could not keep up with the framerate: %d of %d frames are duplicates.\nLower the Framerate setting or reduce the terminal size.",
+						duplicates, counter,
+					)))
+				}
+
 				// Signal caller that we're done recording.
 				close(ch)
 				return
 
-			case <-time.After(interval - time.Since(start)):
-				// record last attempt
-				start = time.Now()
-
-				if !vhs.recording {
-					continue
-				}
-				if vhs.Page == nil {
+			case <-time.After(time.Until(lastFrame.Add(interval))):
+				if !vhs.recording || vhs.Page == nil {
+					// Nothing is captured while paused; restart the schedule
+					// so the paused span does not count as missed frames once
+					// recording resumes.
+					lastFrame = time.Now()
 					continue
 				}
 
 				cursor, cursorErr := vhs.CursorCanvas.CanvasToImage("image/png", quality)
 				text, textErr := vhs.TextCanvas.CanvasToImage("image/png", quality)
 				if textErr != nil || cursorErr != nil {
+					lastFrame = time.Now()
 					ch <- fmt.Errorf("error: %v, %v", textErr, cursorErr)
 					continue
 				}
 
-				counter++
+				// A capture that took longer than the frame interval must fill
+				// every frame slot that elapsed in the meantime: the rendered
+				// video assumes exactly Framerate frames per second, so any
+				// missing slot makes it play back faster than real time.
+				slots := int(time.Since(lastFrame) / interval)
+				if slots < 1 {
+					slots = 1
+				}
+				lastFrame = lastFrame.Add(time.Duration(slots) * interval)
+
+				prev := counter
+				counter += slots
 				if err := os.WriteFile(
 					filepath.Join(vhs.Options.Video.Input, fmt.Sprintf(cursorFrameFormat, counter)),
 					cursor,
@@ -376,6 +400,19 @@ func (vhs *VHS) Record(ctx context.Context) <-chan error {
 					continue
 				}
 
+				// Missed slots replay the previous frame, or the current one
+				// when there is no previous frame yet.
+				backfillSrc := prev
+				if backfillSrc == 0 {
+					backfillSrc = counter
+				}
+				for frame := prev + 1; frame < counter; frame++ {
+					duplicates++
+					if err := duplicateFrame(vhs.Options.Video.Input, backfillSrc, frame); err != nil {
+						ch <- err
+					}
+				}
+
 				// Capture current frame and disable frame capturing
 				if vhs.Options.Screenshot.frameCapture {
 					vhs.Options.Screenshot.makeScreenshot(counter)
@@ -385,6 +422,27 @@ func (vhs *VHS) Record(ctx context.Context) <-chan error {
 	}()
 
 	return ch
+}
+
+// duplicateFrame fills frame slot dst with the text and cursor images of frame
+// src. Hard links keep duplicates cheap; filesystems without hard link support
+// get a copy instead.
+func duplicateFrame(dir string, src, dst int) error {
+	for _, format := range []string{cursorFrameFormat, textFrameFormat} {
+		srcPath := filepath.Join(dir, fmt.Sprintf(format, src))
+		dstPath := filepath.Join(dir, fmt.Sprintf(format, dst))
+		if err := os.Link(srcPath, dstPath); err == nil {
+			continue
+		}
+		data, err := os.ReadFile(srcPath) //nolint:gosec
+		if err != nil {
+			return fmt.Errorf("error duplicating frame: %w", err)
+		}
+		if err := os.WriteFile(dstPath, data, 0o600); err != nil {
+			return fmt.Errorf("error duplicating frame: %w", err)
+		}
+	}
+	return nil
 }
 
 // ResumeRecording indicates to VHS that the recording should be resumed.

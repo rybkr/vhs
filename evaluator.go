@@ -111,8 +111,12 @@ func Evaluate(ctx context.Context, tape string, out io.Writer, opts ...Evaluator
 	}
 
 	// Begin recording frames as we are now in a recording state.
-	ctx, cancel := context.WithCancel(ctx)
-	ch := v.Record(ctx)
+	//
+	// Recording gets its own cancelable context so that stopping the recorder
+	// does not cancel the context handed to Render: ffmpeg would refuse to
+	// start on an already-canceled context.
+	recordCtx, cancel := context.WithCancel(ctx)
+	ch := v.Record(recordCtx)
 
 	// Clean up temporary files at the end.
 	defer func() {
